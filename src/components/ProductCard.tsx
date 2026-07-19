@@ -99,6 +99,33 @@ export default function ProductCard({
   onAddToCart
 }: ProductCardProps) {
   const [selectedColorIndex, setSelectedColorIndex] = useState(0);
+  const [isQuickAdded, setIsQuickAdded] = useState(false);
+  const [isBottomAdded, setIsBottomAdded] = useState(false);
+
+  const handleQuickAdd = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    // Default color selection is the first color or Standard
+    const defaultColor = product.variantColors && product.variantColors.length > 0 
+      ? product.variantColors[0] 
+      : "Standard";
+    onAddToCart(product, 1, defaultColor);
+    setIsQuickAdded(true);
+    setTimeout(() => {
+      setIsQuickAdded(false);
+    }, 2000);
+  };
+
+  const handleBottomAdd = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const chosenColor = product.variantColors && product.variantColors[selectedColorIndex]
+      ? product.variantColors[selectedColorIndex]
+      : (product.variantColors && product.variantColors[0]) || "Standard";
+    onAddToCart(product, 1, chosenColor);
+    setIsBottomAdded(true);
+    setTimeout(() => {
+      setIsBottomAdded(false);
+    }, 2000);
+  };
 
   // Return key technical highlight for a product
   const getHighlightLabel = () => {
@@ -154,7 +181,26 @@ export default function ProductCard({
             className="flex items-center space-x-1.5 text-xs text-gray-300 hover:text-[#C5A05A] tracking-wider uppercase font-medium transition-colors"
           >
             <Eye className="h-3.5 w-3.5" />
-            <span>Quick View</span>
+            <span>View</span>
+          </button>
+
+          {/* Quick Add Button */}
+          <button 
+            onClick={handleQuickAdd}
+            className={`flex items-center space-x-1.5 text-xs tracking-wider uppercase font-medium transition-all duration-300 ${isQuickAdded ? "text-[#C5A05A]" : "text-gray-300 hover:text-[#C5A05A]"}`}
+            title="Immediately add with default color selection"
+          >
+            {isQuickAdded ? (
+              <>
+                <CheckCircle className="h-3.5 w-3.5 text-[#C5A05A] animate-bounce" />
+                <span>Added</span>
+              </>
+            ) : (
+              <>
+                <ShoppingBag className="h-3.5 w-3.5" />
+                <span>Quick Add</span>
+              </>
+            )}
           </button>
 
           <button 
@@ -228,15 +274,25 @@ export default function ProductCard({
 
           {/* Quick Buy Button */}
           <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onAddToCart(product, 1, product.variantColors[selectedColorIndex] || product.variantColors[0] || "Standard");
-            }}
-            className="flex items-center space-x-1 bg-[#C5A05A]/10 hover:bg-[#C5A05A] border border-[#C5A05A]/30 hover:border-[#C5A05A] text-[#C5A05A] hover:text-black transition-all duration-300 px-2.5 py-1 rounded text-[9px] font-mono uppercase tracking-widest font-semibold cursor-pointer"
+            onClick={handleBottomAdd}
+            className={`flex items-center space-x-1 border transition-all duration-300 px-2.5 py-1 rounded text-[9px] font-mono uppercase tracking-widest font-semibold cursor-pointer ${
+              isBottomAdded
+                ? "bg-green-600/20 border-green-500 text-green-400"
+                : "bg-[#C5A05A]/10 hover:bg-[#C5A05A] border-[#C5A05A]/30 hover:border-[#C5A05A] text-[#C5A05A] hover:text-black"
+            }`}
             title="Quickly add masterpiece to cart"
           >
-            <ShoppingBag className="h-3 w-3" />
-            <span className="text-[8px] font-bold">Quick Buy</span>
+            {isBottomAdded ? (
+              <>
+                <CheckCircle className="h-3 w-3 text-green-400" />
+                <span className="text-[8px] font-bold text-green-400">Added!</span>
+              </>
+            ) : (
+              <>
+                <ShoppingBag className="h-3 w-3" />
+                <span className="text-[8px] font-bold">Quick Buy</span>
+              </>
+            )}
           </button>
 
         </div>

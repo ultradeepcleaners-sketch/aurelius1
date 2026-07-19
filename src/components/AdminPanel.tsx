@@ -30,6 +30,51 @@ const COLLECTION_SALES = [
   { name: "Accessories", sales: 32, fill: "#C5A05A" }
 ];
 
+// Compresses an image file on the client side using Canvas to prevent exceeding Firestore 1MB limits.
+function compressImage(file: File, maxWidth = 800, maxHeight = 800, quality = 0.7): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxWidth) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          }
+        } else {
+          if (height > maxHeight) {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(event.target?.result as string);
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+        // Save as jpeg to optimize size compression
+        const dataUrl = canvas.toDataURL("image/jpeg", quality);
+        resolve(dataUrl);
+      };
+      img.onerror = (err) => reject(err);
+    };
+    reader.onerror = (err) => reject(err);
+  });
+}
+
 interface AdminPanelProps {
   products?: Product[];
   onProductAdded?: (newProduct: Product) => void;
@@ -49,7 +94,7 @@ export default function AdminPanel({
   const [authError, setAuthError] = useState("");
 
   // Sub-navigation tabs
-  const [activeTab, setActiveTab] = useState<"analytics" | "inventory" | "deployment">("analytics");
+  const [activeTab, setActiveTab] = useState<"analytics" | "inventory" | "skus" | "deployment">("analytics");
 
   // Dynamic order pipeline tracking
   const [activeOrderStages, setActiveOrderStages] = useState<Record<string, number>>(() => {
@@ -89,6 +134,22 @@ export default function AdminPanel({
   const [formFeatures, setFormFeatures] = useState("");
   const [formVariantColors, setFormVariantColors] = useState("");
   const [formVariantColorsHex, setFormVariantColorsHex] = useState("");
+
+  // SKU Management states inside the form
+  interface SkuFormState {
+    sku: string;
+    color: string;
+    inStock: number;
+  }
+  const [formSkus, setFormSkus] = useState<SkuFormState[]>([]);
+
+  // SKU view search and filter states
+  const [skuSearch, setSkuSearch] = useState("");
+  const [skuCategoryFilter, setSkuCategoryFilter] = useState<"all" | "bags" | "shoes" | "accessories">("all");
+  const [skuStockFilter, setSkuStockFilter] = useState<"all" | "low" | "out">("all");
+  
+  // Tracking status of active SKU updates
+  const [skuSaveStatus, setSkuSaveStatus] = useState<Record<string, "saved" | "error" | "saving">>({});
 
   // Multi-image upload states (up to 10 files)
   const [imageFiles, setImageFiles] = useState<File[]>([]);
@@ -400,6 +461,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     setFormVariantColors(p.variantColors ? p.variantColors.join(", ") : "");
     setFormVariantColorsHex(p.variantColorsHex ? p.variantColorsHex.join(", ") : "");
 
+    // Populate form SKUs
+    if (p.skus && p.skus.length > 0) {
+      setFormSkus(p.skus);
+    } else {
+      const colors = p.variantColors && p.variantColors.length > 0 
+        ? p.variantColors 
+        : ["Classic Amber", "Saddle Tan", "Executive Black"];
+      const generated = colors.map((color) => {
+        const colorSlug = color.toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+        const prodSlug = p.name.toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+        return {
+          sku: `AUR-${p.category.toUpperCase().substring(0, 3)}-${prodSlug}-${colorSlug}`,
+          color,
+          inStock: Math.round(p.inStock / colors.length) || 5
+        };
+      });
+      setFormSkus(generated);
+    }
+
     // Populate existing assets
     setExistingImages(p.images || [p.image]);
     setExistingVideo(p.video || "");
@@ -436,6 +516,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     setFormFeatures("");
     setFormVariantColors("");
     setFormVariantColorsHex("");
+    setFormSkus([]);
 
     setImageFiles([]);
     setImagePreviews([]);
@@ -445,6 +526,95 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     setExistingVideo("");
     setUploadError(null);
     setUploadSuccess(null);
+  };
+
+  const handleGenerateSkusFromColors = () => {
+    const colors = formVariantColors
+      ? formVariantColors.split(",").map(c => c.trim()).filter(Boolean)
+      : ["Classic Amber", "Saddle Tan", "Executive Black"];
+    
+    const prodSlug = (formName || "Product").toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+    const catSlug = formCategory.substring(0, 3).toUpperCase();
+
+    const generated = colors.map((color) => {
+      const colorSlug = color.toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+      return {
+        sku: `AUR-${catSlug}-${prodSlug}-${colorSlug}`,
+        color,
+        inStock: 5
+      };
+    });
+    setFormSkus(generated);
+  };
+
+  const handleUpdateSkuStock = async (productId: string, skuCode: string, newQty: number) => {
+    const parentProduct = products.find(p => p.id === productId);
+    if (!parentProduct) return;
+
+    setSkuSaveStatus(prev => ({ ...prev, [skuCode]: "saving" }));
+
+    // Prepare the updated skus array
+    let currentSkus = parentProduct.skus && parentProduct.skus.length > 0 
+      ? [...parentProduct.skus] 
+      : [];
+
+    if (currentSkus.length === 0) {
+      // Build skus array for the first time
+      const colors = parentProduct.variantColors && parentProduct.variantColors.length > 0 
+        ? parentProduct.variantColors 
+        : ["Classic Amber", "Saddle Tan", "Executive Black"];
+      currentSkus = colors.map((color) => {
+        const colorSlug = color.toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+        const prodSlug = parentProduct.name.toLowerCase().replace(/[^a-z0-9]/g, "").substring(0, 3).toUpperCase();
+        const generatedSku = `AUR-${parentProduct.category.toUpperCase().substring(0, 3)}-${prodSlug}-${colorSlug}`;
+        return {
+          sku: generatedSku,
+          color,
+          inStock: generatedSku === skuCode ? newQty : 5
+        };
+      });
+    } else {
+      // Find and update the existing SKU stock
+      currentSkus = currentSkus.map(s => s.sku === skuCode ? { ...s, inStock: newQty } : s);
+    }
+
+    try {
+      const response = await fetch(`/api/products/${productId}/skus`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skus: currentSkus })
+      });
+
+      const resData = await response.json();
+      if (response.ok && resData.success) {
+        setSkuSaveStatus(prev => ({ ...prev, [skuCode]: "saved" }));
+        
+        // Construct the updated product object to update local state in React
+        const updatedProduct = {
+          ...parentProduct,
+          skus: currentSkus,
+          inStock: currentSkus.reduce((sum, item) => sum + (item.inStock || 0), 0)
+        };
+        
+        if (onProductUpdated) {
+          onProductUpdated(updatedProduct);
+        }
+
+        // Reset saved status badge after 2 seconds
+        setTimeout(() => {
+          setSkuSaveStatus(prev => {
+            const copy = { ...prev };
+            delete copy[skuCode];
+            return copy;
+          });
+        }, 2000);
+      } else {
+        setSkuSaveStatus(prev => ({ ...prev, [skuCode]: "error" }));
+      }
+    } catch (err) {
+      console.error("Failed to update SKU stock level:", err);
+      setSkuSaveStatus(prev => ({ ...prev, [skuCode]: "error" }));
+    }
   };
 
   // Handle uploading or editing product
@@ -472,77 +642,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     setUploadError(null);
 
     try {
-      const formData = new FormData();
-      formData.append("name", formName);
-      formData.append("price", formPrice);
-      if (formOriginalPrice) {
-        formData.append("originalPrice", formOriginalPrice);
-      }
-      formData.append("category", formCategory);
-      formData.append("subcategory", formSubcategory || "Heritage Craft");
-      formData.append("description", formDescription);
-      formData.append("inStock", formInStock);
-      formData.append("dimensions", formDimensions || "Standard Size");
-      formData.append("weight", formWeight || "1.2 kg");
-      formData.append("capacity", formCapacity || "N/A");
-      formData.append("careInstructions", formCare || "Apply beeswax conditioner annually.");
-      formData.append("features", formFeatures || "Genuine Vegetable-Tanned Full Grain Hide");
-      
-      if (formVariantColors) {
-        formData.append("variantColors", formVariantColors);
-      }
-      if (formVariantColorsHex) {
-        formData.append("variantColorsHex", formVariantColorsHex);
-      }
+      // Compress and convert selected files to base64
+      const base64Images = await Promise.all(
+        imageFiles.map((file) => compressImage(file, 800, 800, 0.7))
+      );
 
-      // Append multi-images (up to 10)
-      imageFiles.forEach((file) => {
-        formData.append("images", file);
-      });
-
-      // Append video (if chosen)
+      let base64Video = "";
       if (videoFile) {
-        formData.append("video", videoFile);
+        if (videoFile.size > 600 * 1024) {
+          throw new Error("Video file is too large. Due to database size limits, videos must be under 600 KB.");
+        }
+        base64Video = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.readAsDataURL(videoFile);
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = (err) => reject(err);
+        });
       }
 
-      // Detailed logging for request payload (convert form data to keys representation)
-      const payloadLog: Record<string, any> = {};
-      formData.forEach((value, key) => {
-        if (value instanceof File) {
-          payloadLog[key] = `File: ${value.name} (${value.type}, ${value.size} bytes)`;
-        } else {
-          payloadLog[key] = value;
-        }
-      });
+      // Compute correct stock as sum of SKU stocks if present
+      const finalStock = formSkus.length > 0 
+        ? formSkus.reduce((sum, item) => sum + (item.inStock || 0), 0).toString()
+        : formInStock;
 
-      let response;
+      // Build payload matching exact database and server expectations
+      const payload: Record<string, any> = {
+        name: formName,
+        price: formPrice,
+        category: formCategory,
+        subcategory: formSubcategory || "Heritage Craft",
+        description: formDescription,
+        inStock: finalStock,
+        dimensions: formDimensions || "Standard Size",
+        weight: formWeight || "1.2 kg",
+        capacity: formCapacity || "N/A",
+        careInstructions: formCare || "Apply beeswax conditioner annually.",
+        features: formFeatures || "Genuine Vegetable-Tanned Full Grain Hide",
+        variantColors: formVariantColors,
+        variantColorsHex: formVariantColorsHex,
+        base64Images,
+        base64Video,
+        skus: formSkus
+      };
+
+      if (formOriginalPrice) {
+        payload.originalPrice = formOriginalPrice;
+      }
+
       let reqMethod = "POST";
       let reqUrl = "/api/products";
 
       if (editingProduct) {
-        // Edit Mode: Send PUT
         reqMethod = "PUT";
         reqUrl = `/api/products/${editingProduct.id}`;
-        formData.append("existingImages", JSON.stringify(existingImages));
-        formData.append("existingVideo", existingVideo || "");
-        
-        // Update payloadLog for log trace
-        payloadLog["existingImages"] = JSON.stringify(existingImages);
-        payloadLog["existingVideo"] = existingVideo || "";
-
-        response = await fetch(reqUrl, {
-          method: "PUT",
-          body: formData
-        });
-      } else {
-        // Create Mode: Send POST
-        response = await fetch(reqUrl, {
-          method: "POST",
-          body: formData
-        });
+        payload.existingImages = existingImages;
+        payload.existingVideo = existingVideo;
       }
 
-      const data = await safeParseJSON(response, { url: reqUrl, method: reqMethod, payload: payloadLog });
+      // Check and automatically reduce payload size to stay safely under Firestore's 1MB limit
+      let payloadSize = JSON.stringify(payload).length;
+      console.log(`[Aurelius Client Trace] Initial payload size: ${payloadSize} bytes.`);
+
+      if (payloadSize > 920000) {
+        if (imageFiles.length > 0) {
+          console.warn(`[Aurelius Client Trace] Payload size exceeds safe Firestore threshold. Re-compressing newly uploaded images at lower resolution...`);
+          const superCompressedImages = await Promise.all(
+            imageFiles.map((file) => compressImage(file, 500, 500, 0.4))
+          );
+          payload.base64Images = superCompressedImages;
+          payloadSize = JSON.stringify(payload).length;
+        }
+      }
+
+      if (payloadSize > 920000) {
+        if (payload.base64Video) {
+          console.warn(`[Aurelius Client Trace] Payload is still too large. Dropping uploaded video to fit database limits.`);
+          payload.base64Video = "";
+          payloadSize = JSON.stringify(payload).length;
+          setUploadError("The video file was automatically removed to keep the product page under cloud database storage limits.");
+        }
+      }
+
+      if (payloadSize > 920000) {
+        if (payload.existingImages && payload.existingImages.length > 4) {
+          console.warn(`[Aurelius Client Trace] Payload is still too large. Pruning existing images list to fit database limits.`);
+          payload.existingImages = payload.existingImages.slice(0, 4);
+          payloadSize = JSON.stringify(payload).length;
+        }
+      }
+
+      // Since images are uploaded to GCS or local disk and saved as tiny URLs, the Firestore entry remains under 2KB.
+      // We allow transit payload up to 15MB for the base64 uploading process.
+      if (payloadSize > 15000000) {
+        throw new Error(`The listing files are too large (${Math.round(payloadSize / (1024 * 1024))} MB). Please reduce the number of images or upload smaller files.`);
+      }
+
+      const response = await fetch(reqUrl, {
+        method: reqMethod,
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await safeParseJSON(response, { url: reqUrl, method: reqMethod, payload });
 
       if (response.ok && data.success) {
         if (editingProduct) {
@@ -718,10 +921,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
   };
 
-  // Filter custom added products (the ones with IDs starting with firestore autoIDs or image having /uploads/)
-  const customProducts = products.filter(
-    (p) => p.image && p.image.startsWith("/uploads/")
-  );
+  // Filter custom added products (any product that is not part of the static default catalog)
+  const staticCatalogIds = new Set([
+    "leathfocus-duffle", "nav-duffle", "overlander-weekend", "exec-briefcase",
+    "sovereign-oxford", "nomad-sneaker", "chelsea-boot", "heritage-wallet",
+    "aviator-watch", "care-kit"
+  ]);
+  const customProducts = products.filter((p) => !staticCatalogIds.has(p.id));
 
   // Lock screen UI
   if (!isAuthenticated) {
@@ -817,6 +1023,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }`}
           >
             Manage Inventory
+          </button>
+          <button
+            onClick={() => setActiveTab("skus")}
+            className={`px-3 py-1.5 rounded uppercase font-mono text-[10px] tracking-wider transition-colors ${
+              activeTab === "skus" ? "bg-[#C5A05A] text-black font-bold" : "text-gray-400 hover:text-white"
+            }`}
+          >
+            SKU Stock Ledger
           </button>
           <button
             onClick={() => setActiveTab("deployment")}
@@ -1512,6 +1726,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     onChange={(e) => setFormVariantColorsHex(e.target.value)}
                   />
                 </div>
+              </div>
+
+              {/* INDIVIDUAL SKU MANAGEMENT SECTION */}
+              <div className="bg-[#111111] p-3 rounded border border-gray-800 space-y-3">
+                <div className="flex justify-between items-center">
+                  <span className="font-mono text-[9px] tracking-widest uppercase text-[#C5A05A] block">Individual SKU Ledger</span>
+                  <button
+                    type="button"
+                    onClick={handleGenerateSkusFromColors}
+                    className="text-[9px] font-mono tracking-wider text-[#C5A05A] hover:text-white bg-[#C5A05A]/10 border border-[#C5A05A]/25 rounded px-2 py-0.5 uppercase hover:bg-[#C5A05A]/20 transition-all"
+                  >
+                    Auto-Generate SKUs
+                  </button>
+                </div>
+                
+                {formSkus.length === 0 ? (
+                  <div className="text-center py-4 border border-dashed border-gray-800 rounded bg-[#1A1A1A]/50 text-gray-500 text-[10px]">
+                    No SKUs mapped yet. Click "Auto-Generate SKUs" to create variants based on your colors.
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                    {formSkus.map((item, idx) => (
+                      <div key={idx} className="flex items-center justify-between gap-2 p-2 bg-[#1A1A1A] border border-gray-850 rounded">
+                        <div className="flex flex-col shrink-0">
+                          <span className="text-[10px] font-bold text-white truncate max-w-[110px]">{item.color}</span>
+                          <span className="text-[8px] font-mono text-gray-500 uppercase">Variant</span>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <input
+                            type="text"
+                            required
+                            placeholder="SKU (e.g. AUR-BAG-AMB)"
+                            className="w-full bg-[#111111] border border-gray-800 rounded px-2 py-1 text-[10px] outline-none text-white focus:border-[#C5A05A] font-mono"
+                            value={item.sku}
+                            onChange={(e) => {
+                              const updated = [...formSkus];
+                              updated[idx] = { ...updated[idx], sku: e.target.value.toUpperCase() };
+                              setFormSkus(updated);
+                            }}
+                          />
+                        </div>
+                        <div className="w-16 shrink-0 flex items-center bg-[#111111] border border-gray-800 rounded px-1.5 py-0.5">
+                          <input
+                            type="number"
+                            required
+                            placeholder="Qty"
+                            className="w-full bg-transparent text-[10px] outline-none text-white font-mono text-center"
+                            value={item.inStock}
+                            onChange={(e) => {
+                              const updated = [...formSkus];
+                              updated[idx] = { ...updated[idx], inStock: parseInt(e.target.value) || 0 };
+                              setFormSkus(updated);
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                    <div className="text-[9px] text-gray-500 font-mono text-center">
+                      Combined total stock: <span className="text-white font-bold">{formSkus.reduce((sum, item) => sum + (item.inStock || 0), 0)} units</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* DYNAMIC MULTI-IMAGE UPLOAD (MAX 10) */}

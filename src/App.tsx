@@ -24,6 +24,10 @@ import { AureliusLogger } from "./utils/AureliusLogger";
 import { Product, CartItem, Review, CurrencyCode, formatPrice, CURRENCY_MAP } from "./types";
 import { PRODUCTS } from "./data";
 
+import { collection, getDocs } from "firebase/firestore";
+import { db } from "./firebase";
+import { OperationType, handleFirestoreFault } from "./utils/firestoreDbHandler";
+
 export default function App() {
   // Global States
   const [currency, setCurrency] = useState<CurrencyCode>(() => {
@@ -114,6 +118,32 @@ export default function App() {
     const fetchCustomProducts = async () => {
       const url = "/api/products";
       const method = "GET";
+      
+      const fetchDirectFromFirestore = async () => {
+        const pathForGetDocs = "products";
+        try {
+          console.log("[Aurelius Client Trace] Fetching directly from Firestore...");
+          const querySnapshot = await getDocs(collection(db, pathForGetDocs));
+          const firestoreProds: any[] = [];
+          querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            firestoreProds.push({ id: doc.id, ...data });
+          });
+          console.log("[Aurelius Client Trace] Direct Firestore products loaded:", firestoreProds);
+          if (firestoreProds.length > 0) {
+            setProducts(() => {
+              const mergedMap = new Map<string, Product>();
+              PRODUCTS.forEach(p => mergedMap.set(p.id, p));
+              firestoreProds.forEach(p => mergedMap.set(p.id, p));
+              return Array.from(mergedMap.values());
+            });
+          }
+        } catch (fsErr) {
+          console.error("[Aurelius Client Trace] Failed to fetch directly from Firestore:", fsErr);
+          handleFirestoreFault(fsErr, OperationType.GET, pathForGetDocs);
+        }
+      };
+
       try {
         console.log("[Aurelius Client Trace] Loading custom products from /api/products...");
         const res = await fetch(url);
@@ -140,7 +170,7 @@ export default function App() {
         
         const rawText = await res.text();
         if (!rawText || rawText.trim() === "") {
-          console.warn("[Aurelius Client Trace] Empty response received from /api/products.");
+          console.warn("[Aurelius Client Trace] Empty response received from /api/products. Falling back to direct Firestore.");
           AureliusLogger.logRequestError({
             url,
             method,
@@ -149,12 +179,13 @@ export default function App() {
             error: "Empty response body",
             responseBody: ""
           });
+          await fetchDirectFromFirestore();
           return;
         }
 
         if (!contentType.includes("application/json")) {
-          const errMsg = `Expected JSON but received: "${contentType}"`;
-          console.error(`[Aurelius Client Trace] ${errMsg}. Raw:`, rawText.substring(0, 200));
+          const errMsg = `Expected JSON but received: "${contentType}". Falling back to direct Firestore.`;
+          console.warn(`[Aurelius Client Trace] ${errMsg}`);
           AureliusLogger.logRequestError({
             url,
             method,
@@ -163,6 +194,7 @@ export default function App() {
             error: errMsg,
             responseBody: rawText
           });
+          await fetchDirectFromFirestore();
           return;
         }
 
@@ -195,16 +227,25 @@ export default function App() {
           : (result && result.success && Array.isArray(result.data) ? result.data : []);
 
         if (customProds && customProds.length > 0) {
-          setProducts([...PRODUCTS, ...customProds]);
+          setProducts(() => {
+            const mergedMap = new Map<string, Product>();
+            PRODUCTS.forEach(p => mergedMap.set(p.id, p));
+            customProds.forEach(p => mergedMap.set(p.id, p));
+            return Array.from(mergedMap.values());
+          });
+        } else {
+          // If response was empty array but request succeeded, also double check Firestore
+          await fetchDirectFromFirestore();
         }
       } catch (e: any) {
-        console.error("[Aurelius Client Trace] Failed to load custom products:", e);
+        console.warn("[Aurelius Client Trace] Failed to load custom products via API. Falling back to direct Firestore:", e);
         AureliusLogger.logRequestError({
           url,
           method,
           error: e.message || "Failed to make network request",
           stack: e.stack
         });
+        await fetchDirectFromFirestore();
       }
     };
     fetchCustomProducts();
@@ -544,8 +585,12 @@ export default function App() {
         ) : (
           <AdminPanel 
             products={products}
-            onProductAdded={(newProd) => setProducts(prev => [...prev, newProd])}
+            onProductAdded={(newProd) => setProducts(prev => {
+              const filtered = prev.filter(p => p.id !== newProd.id);
+              return [...filtered, newProd];
+            })}
             onProductDeleted={(id) => setProducts(prev => prev.filter(p => p.id !== id))}
+            onProductUpdated={(updatedProd) => setProducts(prev => prev.map(p => p.id === updatedProd.id ? updatedProd : p))}
           />
         )}
       </main>

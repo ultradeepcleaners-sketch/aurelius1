@@ -23,6 +23,11 @@ export interface Product {
   legacyStory?: string;
   customSpecs?: Record<string, string>;
   video?: string;
+  skus?: {
+    sku: string;
+    color: string;
+    inStock: number;
+  }[];
 }
 
 export interface CartItem {

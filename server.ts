@@ -4,7 +4,8 @@ import fs from "fs";
 import dotenv from "dotenv";
 import multer from "multer";
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, addDoc, getDocs, doc, deleteDoc, updateDoc } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, doc, deleteDoc, updateDoc, setDoc } from "firebase/firestore";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 
@@ -26,13 +27,221 @@ if (fs.existsSync(firebaseConfigPath)) {
 
 // Initialize Firestore on Backend
 let db: any = null;
+let fbStorage: any = null;
 if (firebaseConfig) {
   try {
     const dbApp = initializeApp(firebaseConfig);
     db = getFirestore(dbApp, firebaseConfig.firestoreDatabaseId || "(default)");
-    console.log("[Aurelius Server] Firestore Database connected successfully.");
+    fbStorage = getStorage(dbApp);
+    console.log("[Aurelius Server] Firestore Database and Firebase Storage connected successfully.");
   } catch (e) {
     console.error("Error initializing Firestore in backend:", e);
+  }
+}
+
+// Helper: Save Base64 file locally to /uploads and return its relative path
+function saveBase64Locally(base64Str: string, folder: string, id: string, indexOrType: string | number): string {
+  try {
+    const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return base64Str;
+    }
+    const mimeType = matches[1];
+    const buffer = Buffer.from(matches[2], "base64");
+    let extension = mimeType.split("/")[1] || "jpg";
+    if (extension.includes("+")) {
+      extension = extension.split("+")[0];
+    }
+    const cleanFolder = folder.replace(/\//g, "-");
+    const filename = `${cleanFolder}-${id}-${indexOrType}-${Date.now()}.${extension}`;
+    
+    const uploadsPath = path.join(process.cwd(), "uploads");
+    if (!fs.existsSync(uploadsPath)) {
+      fs.mkdirSync(uploadsPath, { recursive: true });
+    }
+    
+    const filePath = path.join(uploadsPath, filename);
+    fs.writeFileSync(filePath, buffer);
+    console.log(`[Aurelius Server Storage Fallback] Saved base64 file locally to /uploads/${filename}`);
+    return `/uploads/${filename}`;
+  } catch (err) {
+    console.error("[Aurelius Server Storage Fallback Error] Failed to save file locally:", err);
+    return base64Str;
+  }
+}
+
+// Helper: Upload Base64 Image to Firebase Storage and get Download URL
+async function uploadBase64ToStorage(base64Str: string, folder: string, id: string, index: number): Promise<string> {
+  if (!base64Str || !base64Str.startsWith("data:")) {
+    return base64Str;
+  }
+  if (!fbStorage) {
+    console.warn("[Aurelius Server Storage] WARNING: Firebase Storage not initialized. Storing base64 fallback locally.");
+    return saveBase64Locally(base64Str, folder, id, index);
+  }
+  try {
+    const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return base64Str;
+    }
+    const mimeType = matches[1];
+    const buffer = Buffer.from(matches[2], "base64");
+    const extension = mimeType.split("/")[1] || "jpg";
+    const uniqueName = `${folder}/${id}-${index}-${Date.now()}.${extension}`;
+    
+    const storageRef = ref(fbStorage, uniqueName);
+    const snapshot = await uploadBytes(storageRef, buffer, { contentType: mimeType });
+    return await getDownloadURL(snapshot.ref);
+  } catch (err) {
+    console.error("[Aurelius Server Storage Error] Failed to upload base64 image, falling back to local file:", err);
+    return saveBase64Locally(base64Str, folder, id, index);
+  }
+}
+
+// Helper: Upload Base64 Video to Firebase Storage and get Download URL
+async function uploadVideoBase64ToStorage(base64Str: string, id: string): Promise<string> {
+  if (!base64Str || !base64Str.startsWith("data:")) {
+    return base64Str;
+  }
+  if (!fbStorage) {
+    console.warn("[Aurelius Server Storage] WARNING: Firebase Storage not initialized. Storing base64 fallback locally.");
+    return saveBase64Locally(base64Str, "video", id, "main");
+  }
+  try {
+    const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return base64Str;
+    }
+    const mimeType = matches[1];
+    const buffer = Buffer.from(matches[2], "base64");
+    const extension = mimeType.split("/")[1] || "mp4";
+    const uniqueName = `products/videos/${id}-${Date.now()}.${extension}`;
+    
+    const storageRef = ref(fbStorage, uniqueName);
+    const snapshot = await uploadBytes(storageRef, buffer, { contentType: mimeType });
+    return await getDownloadURL(snapshot.ref);
+  } catch (err) {
+    console.error("[Aurelius Server Storage Error] Failed to upload base64 video, falling back to local file:", err);
+    return saveBase64Locally(base64Str, "video", id, "main");
+  }
+}
+
+// Helper: Estimate Firestore Document Size
+function getFirestoreDocSize(data: any): number {
+  let size = 0;
+  if (!data) return size;
+  for (const [key, value] of Object.entries(data)) {
+    size += Buffer.byteLength(key, "utf8");
+    if (value === null || value === undefined) {
+      size += 1;
+    } else if (typeof value === "string") {
+      size += Buffer.byteLength(value, "utf8");
+    } else if (typeof value === "number") {
+      size += 8;
+    } else if (typeof value === "boolean") {
+      size += 1;
+    } else if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === "string") {
+          size += Buffer.byteLength(item, "utf8");
+        } else if (typeof item === "number") {
+          size += 8;
+        } else if (typeof item === "object" && item !== null) {
+          size += Buffer.byteLength(JSON.stringify(item), "utf8");
+        }
+      }
+    } else if (typeof value === "object") {
+      size += Buffer.byteLength(JSON.stringify(value), "utf8");
+    }
+  }
+  return size;
+}
+
+// Migration Function: Find and migrate products containing base64 images to Firebase Storage
+async function migrateProducts() {
+  if (!db || !fbStorage) {
+    console.warn("[Aurelius Migration] DB or Storage not initialized. Skipping product migration.");
+    return;
+  }
+  try {
+    console.log("[Aurelius Migration] Checking products for base64 data to migrate...");
+    const querySnapshot = await getDocs(collection(db, "products"));
+    console.log(`[Aurelius Migration] Found ${querySnapshot.size} products to inspect.`);
+    
+    for (const docSnap of querySnapshot.docs) {
+      const data = docSnap.data();
+      let updated = false;
+      const images = data.images || [];
+      const newImages = [];
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        if (img && typeof img === "string" && img.startsWith("data:image/")) {
+          console.log(`[Aurelius Migration] Migrating base64 image in product "${data.name || "Unnamed"}" (ID: ${docSnap.id})...`);
+          const downloadUrl = await uploadBase64ToStorage(img, "products/migrated", docSnap.id, i);
+          if (downloadUrl && downloadUrl !== img) {
+            newImages.push(downloadUrl);
+            updated = true;
+          } else {
+            newImages.push(img);
+          }
+        } else {
+          newImages.push(img);
+        }
+      }
+
+      let mainImage = data.image;
+      if (mainImage && typeof mainImage === "string" && mainImage.startsWith("data:image/")) {
+        if (newImages.length > 0 && newImages[0] && !newImages[0].startsWith("data:")) {
+          mainImage = newImages[0];
+          updated = true;
+        } else {
+          const downloadUrl = await uploadBase64ToStorage(mainImage, "products/migrated-main", docSnap.id, 99);
+          if (downloadUrl && downloadUrl !== mainImage) {
+            mainImage = downloadUrl;
+            updated = true;
+          }
+        }
+      }
+
+      let thumbnail = data.thumbnail;
+      if (thumbnail && typeof thumbnail === "string" && thumbnail.startsWith("data:image/")) {
+        if (newImages.length > 0 && newImages[0] && !newImages[0].startsWith("data:")) {
+          thumbnail = newImages[0];
+          updated = true;
+        } else {
+          const downloadUrl = await uploadBase64ToStorage(thumbnail, "products/migrated-thumb", docSnap.id, 98);
+          if (downloadUrl && downloadUrl !== thumbnail) {
+            thumbnail = downloadUrl;
+            updated = true;
+          }
+        }
+      }
+
+      let video = data.video;
+      if (video && typeof video === "string" && video.startsWith("data:video/")) {
+        console.log(`[Aurelius Migration] Migrating base64 video in product "${data.name || "Unnamed"}" (ID: ${docSnap.id})...`);
+        const downloadUrl = await uploadVideoBase64ToStorage(video, docSnap.id);
+        if (downloadUrl && downloadUrl !== video) {
+          video = downloadUrl;
+          updated = true;
+        }
+      }
+
+      if (updated) {
+        await updateDoc(doc(db, "products", docSnap.id), {
+          images: newImages,
+          image: mainImage || (newImages[0] || ""),
+          thumbnail: thumbnail || (newImages[0] || ""),
+          video: video || null,
+          updatedAt: new Date().toISOString()
+        });
+        console.log(`[Aurelius Migration] Successfully migrated and updated product "${data.name}" (ID: ${docSnap.id}) in Firestore.`);
+      }
+    }
+    console.log("[Aurelius Migration] Product migration check completed successfully.");
+  } catch (err) {
+    console.error("[Aurelius Migration Error] Error during migration process:", err);
   }
 }
 
@@ -106,8 +315,9 @@ function getAI(): GoogleGenAI {
   return aiClient;
 }
 
-// Middleware for parsing JSON
-app.use(express.json());
+// Middleware for parsing JSON with increased size limits to allow posting large items/images
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Custom Request/Response Tracing Middleware
 app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -121,6 +331,20 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
   if (req.body && Object.keys(req.body).length > 0) {
     const safeBody = { ...req.body };
     if (safeBody.password) safeBody.password = "********";
+    
+    // Safely truncate very large fields (e.g. base64 files/images) to prevent write EPIPE console crashes
+    for (const key of Object.keys(safeBody)) {
+      if (typeof safeBody[key] === "string" && safeBody[key].length > 500) {
+        safeBody[key] = `[TRUNCATED: string of ${safeBody[key].length} chars]`;
+      } else if (Array.isArray(safeBody[key])) {
+        safeBody[key] = safeBody[key].map((item: any) => {
+          if (typeof item === "string" && item.length > 500) {
+            return `[TRUNCATED: string of ${item.length} chars]`;
+          }
+          return item;
+        });
+      }
+    }
     console.log(`[Aurelius Server Trace] Request Payload:`, JSON.stringify(safeBody, null, 2));
   } else {
     console.log(`[Aurelius Server Trace] Request Payload: Empty`);
@@ -135,7 +359,27 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     res.setHeader("Content-Type", "application/json; charset=utf-8");
 
     try {
-      console.log(`[Aurelius Server Trace] Response Body:`, JSON.stringify(body, null, 2).substring(0, 2000));
+      let logBody = body;
+      if (body && typeof body === "object") {
+        logBody = { ...body };
+        if (logBody.data && typeof logBody.data === "object") {
+          logBody.data = { ...logBody.data };
+          for (const k of Object.keys(logBody.data)) {
+            if (typeof logBody.data[k] === "string" && logBody.data[k].length > 500) {
+              logBody.data[k] = `[TRUNCATED: ${logBody.data[k].length} chars]`;
+            }
+          }
+        }
+        if (logBody.product && typeof logBody.product === "object") {
+          logBody.product = { ...logBody.product };
+          for (const k of Object.keys(logBody.product)) {
+            if (typeof logBody.product[k] === "string" && logBody.product[k].length > 500) {
+              logBody.product[k] = `[TRUNCATED: ${logBody.product[k].length} chars]`;
+            }
+          }
+        }
+      }
+      console.log(`[Aurelius Server Trace] Response Body:`, JSON.stringify(logBody, null, 2).substring(0, 2000));
     } catch (e) {
       console.log(`[Aurelius Server Trace] Response Body: [Failed to stringify response body]`);
     }
@@ -210,7 +454,7 @@ app.post("/api/products", uploadMulti.fields([{ name: "images", maxCount: 10 }, 
       name, price, originalPrice, description, category, subcategory, 
       features, laptopCompatibility, waterResistance, 
       dimensions, weight, capacity, careInstructions, inStock,
-      variantColors, variantColorsHex
+      variantColors, variantColorsHex, base64Images, base64Video, skus
     } = req.body;
 
     if (!name || !price || !description || !category) {
@@ -234,6 +478,14 @@ app.post("/api/products", uploadMulti.fields([{ name: "images", maxCount: 10 }, 
       }
     }
 
+    // Support JSON base64 uploads
+    if (base64Images && Array.isArray(base64Images)) {
+      uploadedImages = [...uploadedImages, ...base64Images];
+    }
+    if (base64Video) {
+      uploadedVideo = base64Video;
+    }
+
     if (uploadedImages.length === 0) {
       return res.status(400).json({
         success: false,
@@ -245,14 +497,26 @@ app.post("/api/products", uploadMulti.fields([{ name: "images", maxCount: 10 }, 
     const parsedOriginalPrice = originalPrice ? parseFloat(originalPrice) : undefined;
     const parsedStock = inStock ? parseInt(inStock) : 10;
 
+    const docRef = doc(collection(db, "products"));
+    const generatedId = docRef.id;
+
+    // Upload base64 images and video to Firebase Storage
+    const finalImages = await Promise.all(
+      uploadedImages.map((img, idx) => uploadBase64ToStorage(img, "products", generatedId, idx))
+    );
+    const finalVideo = uploadedVideo ? await uploadVideoBase64ToStorage(uploadedVideo, generatedId) : "";
+
     const productData: any = {
+      id: generatedId,
       name,
+      title: name,
       price: isNaN(parsedPrice) ? 0 : parsedPrice,
       description,
       category,
       subcategory: subcategory || "Heritage Craft",
-      image: uploadedImages[0],
-      images: uploadedImages,
+      image: finalImages[0] || "",
+      images: finalImages,
+      thumbnail: finalImages[0] || "",
       features: features ? (Array.isArray(features) ? features : features.split(",").map((f: string) => f.trim())) : ["Premium full-grain leather", "Meticulous artisan details"],
       variantColors: variantColors ? (Array.isArray(variantColors) ? variantColors : variantColors.split(",").map((c: string) => c.trim())) : ["Classic Amber", "Saddle Tan", "Executive Black"],
       variantColorsHex: variantColorsHex ? (Array.isArray(variantColorsHex) ? variantColorsHex : variantColorsHex.split(",").map((h: string) => h.trim())) : ["#C5A05A", "#8B5A2B", "#111111"],
@@ -263,17 +527,26 @@ app.post("/api/products", uploadMulti.fields([{ name: "images", maxCount: 10 }, 
       capacity: capacity || "28 Litres",
       careInstructions: careInstructions || "Apply organic leather balm and buff clean with a cotton cloth.",
       inStock: isNaN(parsedStock) ? 10 : parsedStock,
+      inventory: isNaN(parsedStock) ? 10 : parsedStock,
+      SKU: req.body.SKU || `AUR-MAN-${Math.floor(Math.random() * 900000 + 100000)}`,
+      supplier: req.body.supplier || "Aurelius Studio",
+      supplierURL: req.body.supplierURL || "",
       rating: 5.0,
       reviewsCount: 1,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      skus: skus ? (typeof skus === "string" ? JSON.parse(skus) : skus) : undefined
     };
 
     if (parsedOriginalPrice !== undefined && !isNaN(parsedOriginalPrice)) {
       productData.originalPrice = parsedOriginalPrice;
+      productData.salePrice = parsedPrice; // Map for schema compliance
+    } else {
+      productData.salePrice = parsedPrice;
     }
 
-    if (uploadedVideo) {
-      productData.video = uploadedVideo;
+    if (finalVideo) {
+      productData.video = finalVideo;
     }
 
     if (!db) {
@@ -283,8 +556,18 @@ app.post("/api/products", uploadMulti.fields([{ name: "images", maxCount: 10 }, 
       });
     }
 
-    const docRef = await addDoc(collection(db, "products"), productData);
-    const addedProduct = { id: docRef.id, ...productData };
+    // Validation: Calculate document size. If above 900KB, return error
+    const docSize = getFirestoreDocSize(productData);
+    console.log(`[Aurelius Server] Calculated Firestore document size for creation of "${name}": ${docSize} bytes.`);
+    if (docSize > 900 * 1024) {
+      return res.status(400).json({
+        success: false,
+        error: "Product data too large"
+      });
+    }
+
+    await setDoc(docRef, productData);
+    const addedProduct = productData;
     
     res.status(201).json({
       success: true,
@@ -310,7 +593,7 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       features, laptopCompatibility, waterResistance, 
       dimensions, weight, capacity, careInstructions, inStock,
       variantColors, variantColorsHex,
-      existingImages, existingVideo // arrays or string lists representing existing images/video to preserve
+      existingImages, existingVideo, base64Images, base64Video, skus // arrays or string lists representing existing images/video to preserve
     } = req.body;
 
     if (!name || !price || !description || !category) {
@@ -334,6 +617,14 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       }
     }
 
+    // Support JSON base64 uploads
+    if (base64Images && Array.isArray(base64Images)) {
+      uploadedImages = [...uploadedImages, ...base64Images];
+    }
+    if (base64Video) {
+      uploadedVideo = base64Video;
+    }
+
     // Process existing images
     let preservedImages: string[] = [];
     if (existingImages) {
@@ -348,7 +639,17 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       }
     }
 
-    const finalImages = [...preservedImages, ...uploadedImages];
+    // Upload base64 images and video to Firebase Storage
+    const finalUploadedImages = await Promise.all(
+      uploadedImages.map((img, idx) => uploadBase64ToStorage(img, "products", id, idx))
+    );
+
+    // Also migrate preserved images if any of them are still base64
+    const finalPreservedImages = await Promise.all(
+      preservedImages.map((img, idx) => uploadBase64ToStorage(img, "products/existing", id, idx))
+    );
+
+    const finalImages = [...finalPreservedImages, ...finalUploadedImages];
 
     if (finalImages.length === 0) {
       return res.status(400).json({
@@ -357,9 +658,9 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       });
     }
 
-    let finalVideo = uploadedVideo;
+    let finalVideo = uploadedVideo ? await uploadVideoBase64ToStorage(uploadedVideo, id) : "";
     if (!finalVideo && existingVideo) {
-      finalVideo = existingVideo;
+      finalVideo = await uploadVideoBase64ToStorage(existingVideo, id);
     }
 
     const parsedPrice = parseFloat(price);
@@ -367,13 +668,16 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
     const parsedStock = inStock ? parseInt(inStock) : 10;
 
     const productData: any = {
+      id,
       name,
+      title: name,
       price: isNaN(parsedPrice) ? 0 : parsedPrice,
       description,
       category,
       subcategory: subcategory || "Heritage Craft",
-      image: finalImages[0],
+      image: finalImages[0] || "",
       images: finalImages,
+      thumbnail: finalImages[0] || "",
       features: features ? (Array.isArray(features) ? features : features.split(",").map((f: string) => f.trim())) : ["Premium full-grain leather", "Meticulous artisan details"],
       variantColors: variantColors ? (Array.isArray(variantColors) ? variantColors : variantColors.split(",").map((c: string) => c.trim())) : ["Classic Amber", "Saddle Tan", "Executive Black"],
       variantColorsHex: variantColorsHex ? (Array.isArray(variantColorsHex) ? variantColorsHex : variantColorsHex.split(",").map((h: string) => h.trim())) : ["#C5A05A", "#8B5A2B", "#111111"],
@@ -384,13 +688,20 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       capacity: capacity || "28 Litres",
       careInstructions: careInstructions || "Apply organic leather balm and buff clean with a cotton cloth.",
       inStock: isNaN(parsedStock) ? 10 : parsedStock,
-      updatedAt: new Date().toISOString()
+      inventory: isNaN(parsedStock) ? 10 : parsedStock,
+      SKU: req.body.SKU || `AUR-UPD-${Math.floor(Math.random() * 900000 + 100000)}`,
+      supplier: req.body.supplier || "Aurelius Studio",
+      supplierURL: req.body.supplierURL || "",
+      updatedAt: new Date().toISOString(),
+      skus: skus ? (typeof skus === "string" ? JSON.parse(skus) : skus) : undefined
     };
 
     if (parsedOriginalPrice !== undefined && !isNaN(parsedOriginalPrice)) {
       productData.originalPrice = parsedOriginalPrice;
+      productData.salePrice = parsedPrice; // Map for schema compliance
     } else {
       productData.originalPrice = null;
+      productData.salePrice = parsedPrice;
     }
 
     if (finalVideo) {
@@ -406,7 +717,17 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
       });
     }
 
-    await updateDoc(doc(db, "products", id), productData);
+    // Validation: Calculate document size. If above 900KB, return error
+    const docSize = getFirestoreDocSize(productData);
+    console.log(`[Aurelius Server] Calculated Firestore document size for edit of "${name}": ${docSize} bytes.`);
+    if (docSize > 900 * 1024) {
+      return res.status(400).json({
+        success: false,
+        error: "Product data too large"
+      });
+    }
+
+    await setDoc(doc(db, "products", id), productData, { merge: true });
     const updatedProduct = { id, ...productData };
 
     res.status(200).json({
@@ -420,6 +741,230 @@ app.put("/api/products/:id", uploadMulti.fields([{ name: "images", maxCount: 10 
     res.status(500).json({
       success: false,
       error: error.message || "Failed to edit product."
+    });
+  }
+});
+
+// API: Lightweight endpoint to update SKUs stock for a product directly
+app.put("/api/products/:id/skus", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { skus } = req.body;
+
+    if (!skus || !Array.isArray(skus)) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing or invalid skus array"
+      });
+    }
+
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        error: "Database not initialized yet."
+      });
+    }
+
+    const totalInStock = skus.reduce((sum: number, item: any) => sum + (parseInt(item.inStock) || 0), 0);
+
+    const updateData = {
+      skus,
+      inStock: totalInStock,
+      inventory: totalInStock,
+      updatedAt: new Date().toISOString()
+    };
+
+    await setDoc(doc(db, "products", id), updateData, { merge: true });
+
+    res.status(200).json({
+      success: true,
+      message: "SKUs stock updated successfully in database",
+      data: updateData
+    });
+  } catch (error: any) {
+    console.error("[Aurelius Server Error] Error updating SKUs stock:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message || "Failed to update SKUs stock."
+    });
+  }
+});
+
+// API: Import product details from AliExpress URL
+app.post("/api/products/import-aliexpress", async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) {
+      return res.status(400).json({ success: false, error: "AliExpress URL is required." });
+    }
+
+    console.log(`[Aurelius AliExpress Importer] Importing URL: ${url}`);
+
+    let html = "";
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9"
+        }
+      });
+      if (response.ok) {
+        html = await response.text();
+      } else {
+        console.warn(`[Aurelius AliExpress Importer] HTTP status ${response.status} when fetching URL.`);
+      }
+    } catch (fetchErr: any) {
+      console.error("[Aurelius AliExpress Importer] Direct fetch failed:", fetchErr);
+    }
+
+    let pageContext = "";
+    if (html) {
+      const titleMatch = html.match(/<title>([\s\S]*?)<\/title>/i);
+      const metaMatches = [...html.matchAll(/<meta[^>]+(?:name|property)=["']([^"']+)["'][^>]+content=["']([^"']+)["']/gi)];
+      const metaTags = metaMatches.map(m => `${m[1]}: ${m[2]}`).join("\n");
+      const titleText = titleMatch ? titleMatch[1].trim() : "";
+      
+      const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
+      let imageString = "";
+      for (const script of scripts) {
+        const content = script[1];
+        if (content.includes("image") && content.includes(".jpg") && content.length < 50000) {
+          imageString += content.substring(0, 1000);
+        }
+      }
+
+      pageContext = `Title: ${titleText}\nMeta Tags:\n${metaTags}\nImage Hints:\n${imageString.substring(0, 1000)}`;
+    }
+
+    const prompt = `You are the Aurelius Master Catalog Integration Expert. 
+Analyze the following AliExpress product page details (or the URL keywords if page details are sparse/blocked) and translate them into our elite luxury brand format.
+
+AliExpress URL: "${url}"
+Scraped Page Details:
+"""
+${pageContext || "Scraping was blocked. Please generate a luxury product based on keywords in the URL path."}
+"""
+
+You MUST return a JSON object representing a completed, high-end product in the exact structure.
+The fields to map are:
+- "name": An editorial, elegant, and concise product title (e.g., "Aurelius Tuscan Suede Weekender" instead of a long spammy title).
+- "title": (same as name)
+- "price": A retail price in USD (suggest a premium price between $100 and $500 based on item category).
+- "originalPrice": A slightly higher original price to simulate exclusive discount (e.g. price * 1.2).
+- "category": Must be one of: "bags", "shoes", "accessories".
+- "subcategory": A specific style (e.g. "Travel Duffel", "Suede Boot", "Leather Wallet").
+- "description": An exquisite, three-sentence copywriting narrative describing the material choice (Crazy Horse full-grain, Tuscan calfskin, etc.), hand-stitching, and the elite lifestyle it serves.
+- "images": An array of high-quality image URLs. If we scraped image URLs from og:image (usually matching strings like "https://ae01.alicdn.com/kf/...jpg"), include them! Otherwise, use professional, high-resolution Unsplash image URLs of matching luxury leather items.
+- "thumbnail": (same as images[0])
+- "features": A list of 4 refined technical bullet points (e.g., "Meticulous German high-tension stitched seams").
+- "variantColors": An array of 3 sophisticated luxury colors (e.g., ["Classic Amber", "Saddle Tan", "Executive Black"]).
+- "variantColorsHex": Matching hex values for colors (e.g., ["#C5A05A", "#8B5A2B", "#111111"]).
+- "dimensions": e.g., "48cm L x 22cm W x 24cm H"
+- "weight": e.g., "1.5 kg"
+- "capacity": e.g., "30 Litres" (or null if not bags)
+- "laptopCompatibility": (for bags, e.g. "Integrated sleeve fits up to 15.6-inch laptops", otherwise null)
+- "waterResistance": "Moderate moisture protection"
+- "careInstructions": A detailed, luxury care tip (e.g., "Moisturize with organic beeswax conditioner once every six months").
+- "inStock": 12 (or a random integer between 5 and 20)
+- "SKU": A unique code like "AUR-ALI-XXXXXX"
+- "supplier": "AliExpress"
+- "supplierURL": "${url}"
+
+Ensure the output is STRICTLY valid JSON inside a codeblock, conforming to the requested schema.`;
+
+    const response = await getAI().models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            title: { type: Type.STRING },
+            price: { type: Type.NUMBER },
+            originalPrice: { type: Type.NUMBER },
+            category: { type: Type.STRING },
+            subcategory: { type: Type.STRING },
+            description: { type: Type.STRING },
+            images: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            thumbnail: { type: Type.STRING },
+            features: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            variantColors: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            variantColorsHex: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            dimensions: { type: Type.STRING },
+            weight: { type: Type.STRING },
+            capacity: { type: Type.STRING },
+            laptopCompatibility: { type: Type.STRING },
+            waterResistance: { type: Type.STRING },
+            careInstructions: { type: Type.STRING },
+            inStock: { type: Type.NUMBER },
+            SKU: { type: Type.STRING },
+            supplier: { type: Type.STRING },
+            supplierURL: { type: Type.STRING }
+          },
+          required: [
+            "name", "title", "price", "category", "subcategory", 
+            "description", "images", "thumbnail", "features", 
+            "variantColors", "variantColorsHex", "dimensions", 
+            "weight", "careInstructions", "inStock", "SKU", 
+            "supplier", "supplierURL"
+          ]
+        }
+      }
+    });
+
+    const parsedProduct = JSON.parse(response.text || "{}");
+
+    // Add extra required fields for database/storefront completeness
+    parsedProduct.image = parsedProduct.images[0] || "";
+    parsedProduct.salePrice = parsedProduct.price;
+    parsedProduct.inventory = parsedProduct.inStock;
+    parsedProduct.rating = 4.8;
+    parsedProduct.reviewsCount = Math.floor(10 + Math.random() * 50);
+    parsedProduct.createdAt = new Date().toISOString();
+    parsedProduct.updatedAt = new Date().toISOString();
+
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        error: "Database not initialized yet."
+      });
+    }
+
+    // Save to Firestore
+    const docRef = doc(collection(db, "products"));
+    parsedProduct.id = docRef.id;
+    await setDoc(docRef, parsedProduct);
+    const addedProduct = parsedProduct;
+
+    console.log(`[Aurelius AliExpress Importer] Product successfully imported and committed to Firestore: ID ${docRef.id}`);
+
+    res.status(201).json({
+      success: true,
+      message: `Product "${parsedProduct.name}" successfully imported from AliExpress!`,
+      data: addedProduct,
+      product: addedProduct
+    });
+
+  } catch (error: any) {
+    console.error("[Aurelius AliExpress Importer Error]:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message || "Failed to import product from AliExpress."
     });
   }
 });
@@ -661,6 +1206,14 @@ app.post("/api/ai/diagnose-care", async (req, res) => {
   }
 });
 
+// Global API 404 handler: Catch any unhandled request starting with /api/ and return JSON only
+app.all("/api/*", (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `API Route Not Found: ${req.method} ${req.url}`
+  });
+});
+
 // Global Error Handler for API routes to always return JSON instead of HTML
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("[Aurelius Server Error]:", err);
@@ -689,6 +1242,10 @@ const startServer = async () => {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Aurelius Server] Luxury eCommerce backend running on http://localhost:${PORT}`);
+    // Run the existing products migration in the background
+    migrateProducts().catch(err => {
+      console.error("[Aurelius Server] Migration on startup failed:", err);
+    });
   });
 };
 
