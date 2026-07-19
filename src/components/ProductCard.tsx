@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Eye, Heart, RefreshCw, Star, Flame, CheckCircle, ShoppingBag } from "lucide-react";
 import { Product, CurrencyCode, formatPrice } from "../types";
+import { AureliusLogger } from "../utils/AureliusLogger";
 
 interface LazyImageProps {
   src: string;
@@ -12,9 +13,13 @@ interface LazyImageProps {
 function LazyImage({ src, alt, className = "", referrerPolicy }: LazyImageProps) {
   const [isIntersected, setIsIntersected] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [hasError, setHasError] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    setIsLoaded(false);
+    setHasError(false);
+
     if (!("IntersectionObserver" in window)) {
       setIsIntersected(true);
       return;
@@ -49,7 +54,7 @@ function LazyImage({ src, alt, className = "", referrerPolicy }: LazyImageProps)
   return (
     <div ref={containerRef} className="relative w-full h-full overflow-hidden bg-[#111111] flex items-center justify-center">
       {/* Luxurious placeholder with gold branding style */}
-      {!isLoaded && (
+      {!isLoaded && !hasError && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-br from-[#1C1C1C] to-[#141414] animate-pulse">
           <div className="w-9 h-9 border border-[#C5A05A]/15 rounded-full flex items-center justify-center mb-1">
             <span className="text-[9px] font-mono text-[#C5A05A]/40 tracking-wider">A</span>
@@ -60,13 +65,37 @@ function LazyImage({ src, alt, className = "", referrerPolicy }: LazyImageProps)
         </div>
       )}
 
+      {/* Luxurious Asset Offline Fallback */}
+      {hasError && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-br from-[#1C1C1C] to-[#141414] border border-[#C5A05A]/20 p-4 text-center">
+          <div className="w-10 h-10 border border-[#C5A05A]/20 rounded-full flex items-center justify-center mb-2 bg-[#1A1A1A]">
+            <span className="text-[10px] font-mono text-[#C5A05A] tracking-wider font-bold">A</span>
+          </div>
+          <span className="text-[8px] font-mono text-[#C5A05A] uppercase tracking-[0.2em] mb-1">
+            Asset Offline
+          </span>
+          <span className="text-[7px] font-mono text-gray-500 truncate max-w-[140px]" title={alt}>
+            {alt}
+          </span>
+        </div>
+      )}
+
       {/* Actual image element loaded dynamically */}
-      {isIntersected && (
+      {isIntersected && !hasError && (
         <img
           src={src}
           alt={alt}
           referrerPolicy={referrerPolicy}
           onLoad={() => setIsLoaded(true)}
+          onError={() => {
+            setHasError(true);
+            AureliusLogger.log({
+              type: "error",
+              url: src,
+              method: "GET (Image)",
+              error: `Failed to load product grid image asset for "${alt}"`
+            });
+          }}
           className={`${className} transition-all duration-1000 ease-out ${
             isLoaded ? "opacity-100 blur-0 scale-100" : "opacity-0 blur-sm scale-102"
           }`}
@@ -151,12 +180,19 @@ export default function ProductCard({
         {/* Soft shadow gradients overlay */}
         <div className="absolute inset-0 bg-gradient-to-t from-black/20 via-transparent to-transparent pointer-events-none" />
 
-        {/* Hot / Low Stock Badge */}
-        {product.inStock <= 10 && (
-          <div className="absolute top-3 left-3 flex items-center space-x-1 bg-[#A5673F] text-white font-mono text-[9px] uppercase tracking-widest px-2.5 py-1 rounded shadow-lg animate-pulse">
+        {/* Hot / Low Stock / Limited Stock Badge */}
+        {product.stockLevel !== undefined && product.stockLevel < 5 ? (
+          <div className="absolute top-3 left-3 flex items-center space-x-1 bg-red-700 text-white font-mono text-[9px] uppercase tracking-widest px-2.5 py-1 rounded shadow-lg animate-pulse z-10 border border-red-500/30">
             <Flame className="h-3 w-3 text-white" />
-            <span>Only {product.inStock} Left</span>
+            <span>Limited Stock</span>
           </div>
+        ) : (
+          product.inStock <= 10 && (
+            <div className="absolute top-3 left-3 flex items-center space-x-1 bg-[#A5673F] text-white font-mono text-[9px] uppercase tracking-widest px-2.5 py-1 rounded shadow-lg animate-pulse">
+              <Flame className="h-3 w-3 text-white" />
+              <span>Only {product.inStock} Left</span>
+            </div>
+          )
         )}
 
         {/* Handcrafted Badge */}

@@ -3,6 +3,7 @@ import {
   Sparkles, Star, ChevronRight, Lock, ShieldCheck, Mail, Check, 
   RefreshCw, Heart, Eye, ArrowRight, Trash2, ArrowUpRight, Award, MapPin 
 } from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
 
 import Header from "./components/Header";
 import Hero from "./components/Hero";
@@ -28,11 +29,60 @@ import { collection, getDocs } from "firebase/firestore";
 import { db } from "./firebase";
 import { OperationType, handleFirestoreFault } from "./utils/firestoreDbHandler";
 
+function detectCurrencyFromLocale(): CurrencyCode {
+  try {
+    const locales = navigator.languages ? [...navigator.languages] : [];
+    if (navigator.language) {
+      locales.unshift(navigator.language);
+    }
+    
+    for (const locale of locales) {
+      if (!locale) continue;
+      const cleanLocale = locale.toLowerCase();
+      
+      // Check for country suffixes or language codes
+      if (cleanLocale.endsWith("-gb") || cleanLocale.endsWith("-uk") || cleanLocale === "en-gb" || cleanLocale === "gb" || cleanLocale.includes("en-gb")) {
+        return "GBP";
+      }
+      if (cleanLocale.endsWith("-jp") || cleanLocale === "ja" || cleanLocale === "ja-jp" || cleanLocale === "jp" || cleanLocale.includes("ja-jp")) {
+        return "JPY";
+      }
+      if (cleanLocale.endsWith("-ca") || cleanLocale === "en-ca" || cleanLocale === "ca" || cleanLocale.includes("en-ca")) {
+        return "CAD";
+      }
+      if (cleanLocale.endsWith("-au") || cleanLocale === "en-au" || cleanLocale === "au" || cleanLocale.includes("en-au")) {
+        return "AUD";
+      }
+      if (cleanLocale.endsWith("-gh") || cleanLocale === "en-gh" || cleanLocale === "gh" || cleanLocale === "ak" || cleanLocale === "ee" || cleanLocale === "fat" || cleanLocale === "ga" || cleanLocale === "ha" || cleanLocale.includes("en-gh")) {
+        return "GHS";
+      }
+      
+      // European countries using Euro
+      const euroCountries = ["-de", "-fr", "-it", "-es", "-nl", "-be", "-at", "-fi", "-gr", "-ie", "-pt", "-lu", "-sk", "-si", "-cy", "-ee", "-lv", "-lt", "-mt", "de-", "fr-", "it-", "es-", "nl-"];
+      if (euroCountries.some(suffix => cleanLocale.includes(suffix)) || 
+          ["de", "fr", "it", "es", "nl", "be", "at", "fi", "gr", "ie", "pt", "lu", "sk", "si", "cy", "ee", "lv", "lt", "mt"].includes(cleanLocale)) {
+        return "EUR";
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to detect browser locale currency:", e);
+  }
+  return "USD";
+}
+
 export default function App() {
   // Global States
   const [currency, setCurrency] = useState<CurrencyCode>(() => {
     const saved = localStorage.getItem("aurelius_currency");
-    return (saved as CurrencyCode) || "USD";
+    if (saved) return saved as CurrencyCode;
+    return detectCurrencyFromLocale();
+  });
+
+  const [suggestedCurrency, setSuggestedCurrency] = useState<CurrencyCode | null>(() => {
+    const saved = localStorage.getItem("aurelius_currency");
+    if (saved) return null;
+    const detected = detectCurrencyFromLocale();
+    return detected !== "USD" ? detected : null;
   });
 
   const [rateTrigger, setRateTrigger] = useState(0);
@@ -450,19 +500,34 @@ export default function App() {
               ) : (
                 /* Products Grid */
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
-                  {filteredProducts.map((prod) => (
-                    <ProductCard
-                      key={prod.id}
-                      product={prod}
-                      onQuickView={(p) => setActiveViewingProduct(p)}
-                      onToggleWishlist={handleToggleWishlist}
-                      isWishlisted={wishlist.includes(prod.id)}
-                      onToggleCompare={handleToggleCompare}
-                      isCompared={!!compareList.find(p => p.id === prod.id)}
-                      currency={currency}
-                      onAddToCart={handleAddToCart}
-                    />
-                  ))}
+                  <AnimatePresence mode="popLayout">
+                    {filteredProducts.map((prod, index) => (
+                      <motion.div
+                        key={`${currentCategory}-${searchQuery}-${prod.id}`}
+                        layout
+                        initial={{ opacity: 0, y: 15 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        transition={{
+                          duration: 0.45,
+                          ease: [0.16, 1, 0.3, 1],
+                          delay: Math.min(index * 0.05, 0.3)
+                        }}
+                        className="h-full"
+                      >
+                        <ProductCard
+                          product={prod}
+                          onQuickView={(p) => setActiveViewingProduct(p)}
+                          onToggleWishlist={handleToggleWishlist}
+                          isWishlisted={wishlist.includes(prod.id)}
+                          onToggleCompare={handleToggleCompare}
+                          isCompared={!!compareList.find(p => p.id === prod.id)}
+                          currency={currency}
+                          onAddToCart={handleAddToCart}
+                        />
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
                 </div>
               )}
 
@@ -754,6 +819,58 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* DYNAMIC CURRENCY SUGGESTION TOAST */}
+      <AnimatePresence>
+        {suggestedCurrency && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 20, scale: 0.95 }}
+            transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
+            className="fixed bottom-6 left-6 z-50 max-w-sm w-full bg-[#161616]/95 border border-[#C5A05A]/30 rounded p-5 shadow-2xl backdrop-blur-md text-white font-sans flex items-start justify-between gap-4"
+          >
+            <div className="flex-1 space-y-2">
+              <span className="font-mono text-[8px] tracking-[0.25em] text-[#C5A05A] uppercase block">
+                Locale Match Detected
+              </span>
+              <h4 className="font-serif text-xs font-bold uppercase tracking-wider text-white">
+                Aurelius Tailored Curation
+              </h4>
+              <p className="text-[11px] text-gray-400 font-light leading-relaxed">
+                We detected your locale preference and selected <strong className="text-white font-mono">{suggestedCurrency} ({CURRENCY_MAP[suggestedCurrency]?.symbol})</strong> to offer you a seamless boutique experience.
+              </p>
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  onClick={() => {
+                    localStorage.setItem("aurelius_currency", suggestedCurrency);
+                    setSuggestedCurrency(null);
+                  }}
+                  className="px-3 py-1.5 bg-[#C5A05A] hover:bg-[#b98b5d] text-black text-[10px] tracking-wider uppercase font-mono font-bold rounded-sm transition-all"
+                >
+                  Keep {suggestedCurrency}
+                </button>
+                <button
+                  onClick={() => {
+                    setCurrency("USD");
+                    localStorage.setItem("aurelius_currency", "USD");
+                    setSuggestedCurrency(null);
+                  }}
+                  className="px-2.5 py-1.5 bg-transparent hover:bg-white/5 text-gray-400 hover:text-white border border-gray-800 text-[10px] tracking-wider uppercase font-mono rounded-sm transition-all"
+                >
+                  Switch to USD ($)
+                </button>
+              </div>
+            </div>
+            <button
+              onClick={() => setSuggestedCurrency(null)}
+              className="text-gray-500 hover:text-white transition-colors text-base font-mono leading-none"
+            >
+              &times;
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
     </div>
   );

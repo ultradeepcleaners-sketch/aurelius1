@@ -20,6 +20,7 @@ export interface Product {
   capacity?: string;
   careInstructions: string;
   inStock: number;
+  stockLevel?: number;
   legacyStory?: string;
   customSpecs?: Record<string, string>;
   video?: string;

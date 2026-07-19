@@ -157,6 +157,7 @@ so that its bright.....`,
     capacity: "42 Litres",
     careInstructions: "Wipe with a clean microfibre cloth. Spot clean the interior nylon lining with warm soapy water.",
     inStock: 5,
+    stockLevel: 3,
     legacyStory: "Engineered for rugged luxury, merging military-grade stitching with high-fashion Italian calfskin. A staple for coastal weekend getaways."
   },
   {
@@ -189,6 +190,7 @@ so that its bright.....`,
     capacity: "12 Litres",
     careInstructions: "Avoid deep scratches from sharp metal objects. Wipe with specialized leather cream.",
     inStock: 18,
+    stockLevel: 2,
     legacyStory: "Designed for corporate lawyers and high-stakes executives. This briefcase is crafted using high-tensile British bonded threads to guarantee structural lifetime durability."
   },
   {

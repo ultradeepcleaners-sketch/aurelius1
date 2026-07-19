@@ -70,6 +70,25 @@
           }
         }
       }
+    },
+    "blogs": {
+      "description": "Curated luxurious blog articles published via the Admin Dashboard",
+      "documents": {
+        "{blogId}": {
+          "fields": {
+            "id": "string",
+            "title": "string",
+            "category": "string",
+            "readTime": "string",
+            "date": "string",
+            "excerpt": "string",
+            "content": "string",
+            "image": "string",
+            "tags": "array",
+            "createdAt": "string"
+          }
+        }
+      }
     }
   }
 }
